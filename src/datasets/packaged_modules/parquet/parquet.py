@@ -178,6 +178,9 @@ class Parquet(datasets.ArrowBasedBuilder):
                 yield {"files": [file], "row_groups_list": [row_groups]}
 
     def _generate_tables(self, files, row_groups_list):
+        import time
+        import logging
+        
         if self.config.features is not None and self.config.columns is not None:
             if sorted(field.name for field in self.info.features.arrow_schema) != sorted(self.config.columns):
                 raise ValueError(
@@ -189,36 +192,63 @@ class Parquet(datasets.ArrowBasedBuilder):
             else self.config.filters
         )
         parquet_file_format = ds.ParquetFileFormat(default_fragment_scan_options=self.config.fragment_scan_options)
+        
         for file_idx, (file, row_groups) in enumerate(zip(files, row_groups_list)):
             try:
+                t0 = time.perf_counter()
                 with open(file, "rb") as f:
+                    t1 = time.perf_counter()
+                    
+                    # 1. Measure Metadata / Footer reading
                     parquet_fragment = parquet_file_format.make_fragment(f)
-                    fragment_is_closed = False
-                    try:
-                        if row_groups is not None:
-                            parquet_fragment = parquet_fragment.subset(row_group_ids=row_groups)
-                        if parquet_fragment.row_groups:
-                            batch_size = self.config.batch_size or parquet_fragment.row_groups[0].num_rows
-                            for batch_idx, record_batch in enumerate(
-                                parquet_fragment.to_batches(
-                                    batch_size=batch_size,
-                                    columns=self.config.columns,
-                                    filter=filter_expr,
-                                    batch_readahead=0,
-                                    fragment_readahead=0,
-                                )
-                            ):
-                                pa_table = pa.Table.from_batches([record_batch])
-                                # Uncomment for debugging (will print the Arrow table size and elements)
-                                # logger.warning(f"pa_table: {pa_table} num rows: {pa_table.num_rows}")
-                                # logger.warning('\n'.join(str(pa_table.slice(i, 1).to_pydict()) for i in range(pa_table.num_rows)))
-                                yield Key(file_idx, batch_idx), self._cast_table(pa_table)
-                            fragment_is_closed = True
-                    finally:
-                        # Fix for https://github.com/apache/arrow/issues/45214
-                        if not fragment_is_closed and datasets.config.PYARROW_VERSION <= version.parse("24.0.0"):
-                            del parquet_fragment
-                            gc.collect()
+                    if row_groups is not None:
+                        parquet_fragment.subset(row_group_ids=row_groups)
+                    t2 = time.perf_counter()
+                    
+                    if parquet_fragment.row_groups:
+                        batch_size = self.config.batch_size or parquet_fragment.row_groups[0].num_rows
+                        
+                        batch_iter = parquet_fragment.to_batches(
+                            batch_size=batch_size,
+                            columns=self.config.columns,
+                            filter=filter_expr,
+                            batch_readahead=0,
+                            fragment_readahead=0,
+                        )
+                        
+                        batch_idx = 0
+                        while True:
+                            # 2. Measure PyArrow C++ Decompression & Reading
+                            t3 = time.perf_counter()
+                            try:
+                                record_batch = next(batch_iter)
+                            except StopIteration:
+                                break
+                            t4 = time.perf_counter()
+                            
+                            # 3. Measure Hugging Face CPU casting
+                            pa_table = pa.Table.from_batches([record_batch])
+                            casted_table = self._cast_table(pa_table)
+                            t5 = time.perf_counter()
+                            
+                            # 4. Measure Downstream (Tokenization, PyTorch Collation, GPU wait)
+                            yield Key(file_idx, batch_idx), casted_table
+                            t6 = time.perf_counter()
+                            
+                            # Calculate sizes and speeds
+                            size_mb = record_batch.nbytes / (1024 * 1024)
+                            read_speed = size_mb / (t4 - t3) if (t4 - t3) > 0 else 0
+                            
+                            print(
+                                f"\n[CPU BENCHMARK - File {file_idx} | Batch {batch_idx} | {size_mb:.2f} MB]\n"
+                                f"  -> File Open:          {t1 - t0:.4f}s\n"
+                                f"  -> Read Metadata:      {t2 - t1:.4f}s\n"
+                                f"  -> PyArrow Decompress: {t4 - t3:.4f}s ({read_speed:.2f} MB/s)\n"
+                                f"  -> HF Table Cast:      {t5 - t4:.4f}s\n"
+                                f"  -> Downstream (Yield): {t6 - t5:.4f}s (Tokenize/PyTorch/GPU)\n"
+                                f"------------------------------------------------"
+                            )
+                            batch_idx += 1
             except (pa.ArrowInvalid, ValueError) as e:
                 if self.config.on_bad_files == "error":
                     logger.error(f"Failed to read file '{file}' with error {type(e).__name__}: {e}")
