@@ -147,9 +147,15 @@ def _examples_to_batch(examples: list[dict[str, Any]]) -> dict[str, list]:
 
 def _batch_to_examples(batch: dict[str, list]) -> Iterator[dict[str, Any]]:
     """Convert a batch (dict of examples) to examples list"""
+    t0 = time.perf_counter()
     n_examples = 0 if len(batch) == 0 else len(batch[next(iter(batch))])
+    
+    # This is the line that shatters the PyArrow Table into Python Dicts
     for i in range(n_examples):
         yield {col: array[i] for col, array in batch.items()}
+        
+    t1 = time.perf_counter()
+    print(f"BENCHMARK: _batch_to_examples took {t1 - t0:.6f}s for {n_examples} rows", flush=True)
 
 
 def _convert_to_arrow(
@@ -2350,7 +2356,10 @@ class FormattedExamplesIterable(_BaseExamplesIterable):
         if self.ex_iterable.iter_arrow:
             # feature casting (inc column addition) handled within self._iter_arrow()
             for key, pa_table in self._iter_arrow():
+                t_start = time.perf_counter()
                 batch = formatter.format_batch(pa_table)
+                t_end = time.perf_counter()
+                print(f"BENCHMARK: Table Formatting took {t_end - t_start:.6f}s for {len(pa_table)} rows", flush=True)
                 for example in _batch_to_examples(batch):
                     yield key, example
         else:
