@@ -197,13 +197,21 @@ class Parquet(datasets.ArrowBasedBuilder):
             try:
                 t0 = time.perf_counter()
                 with open(file, "rb") as f:
-                    t1 = time.perf_counter()
-                    
                     # 1. Measure Metadata / Footer reading
                     parquet_fragment = parquet_file_format.make_fragment(f)
                     if row_groups is not None:
                         parquet_fragment.subset(row_group_ids=row_groups)
-                    t2 = time.perf_counter()
+                    
+                    t1 = time.perf_counter()
+                    
+                    import datasets.config
+                    if not hasattr(datasets.config, "hf_parquet_io_time"):
+                        datasets.config.hf_parquet_io_time = 0.0
+                    
+                    # Accumulate footer reading network wait!
+                    datasets.config.hf_parquet_io_time += (t1 - t0)
+
+                    t2 = t1
                     
                     if parquet_fragment.row_groups:
                         batch_size = self.config.batch_size or parquet_fragment.row_groups[0].num_rows
