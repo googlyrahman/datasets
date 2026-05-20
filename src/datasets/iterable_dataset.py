@@ -137,12 +137,19 @@ def _infer_features_from_batch(batch: dict[str, list], try_features: Optional[Fe
 
 
 def _examples_to_batch(examples: list[dict[str, Any]]) -> dict[str, list]:
-    # we order the columns by order of appearance
-    # to do so, we use a dict as an ordered set
+    import datasets.config
+    t0 = time.perf_counter()
+    
     cols = {col: None for example in examples for col in example}
-    # when an example is missing a column, we set the value to None with .get()
     arrays = [[example.get(col) for example in examples] for col in cols]
-    return dict(zip(cols, arrays))
+    result = dict(zip(cols, arrays))
+    
+    t1 = time.perf_counter()
+    if not hasattr(datasets.config, "hf_examples_to_batch_time"):
+        datasets.config.hf_examples_to_batch_time = 0.0
+    datasets.config.hf_examples_to_batch_time += (t1 - t0)
+    
+    return result
 
 
 def _batch_to_examples(batch: dict[str, list]) -> Iterator[dict[str, Any]]:
@@ -2367,10 +2374,19 @@ class FormattedExamplesIterable(_BaseExamplesIterable):
         if self.ex_iterable.iter_arrow:
             # feature casting (inc column addition) handled within self._iter_arrow()
             for key, pa_table in self._iter_arrow():
+                
+                # --- START BENCHMARK ---
                 t_start = time.perf_counter()
+                
                 batch = formatter.format_batch(pa_table)
+                
                 t_end = time.perf_counter()
-                print(f"BENCHMARK: Table Formatting took {t_end - t_start:.6f}s for {len(pa_table)} rows", flush=True)
+                import datasets.config
+                if not hasattr(datasets.config, "hf_format_batch_time"):
+                    datasets.config.hf_format_batch_time = 0.0
+                datasets.config.hf_format_batch_time += (t_end - t_start)
+                # --- END BENCHMARK ---
+
                 for example in _batch_to_examples(batch):
                     yield key, example
         else:
@@ -2380,13 +2396,23 @@ class FormattedExamplesIterable(_BaseExamplesIterable):
                 else None  # cast in case features is None
             )
             for key, example in self.ex_iterable:
-                # don't apply feature types if already applied by ex_iterable (e.g. in case of chained with_format)
                 if self.features and not self.ex_iterable.is_typed:
                     example = _apply_feature_types_on_example(
                         example, self.features, token_per_repo_id=self.token_per_repo_id
                     )
                 if format_dict:
+                    # --- START ROW CAST TIMING ---
+                    import datasets.config
+                    t0 = time.perf_counter()
+                    
                     example = format_dict(example)
+                    
+                    t1 = time.perf_counter()
+                    if not hasattr(datasets.config, "hf_format_row_time"):
+                        datasets.config.hf_format_row_time = 0.0
+                    datasets.config.hf_format_row_time += (t1 - t0)
+                    # --- END ROW CAST TIMING ---
+                    
                 yield key, example
 
     def _iter_arrow(self) -> Iterator[tuple[Key, pa.Table]]:
