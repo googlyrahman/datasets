@@ -217,8 +217,9 @@ class Parquet(datasets.ArrowBasedBuilder):
                         )
                         
                         batch_idx = 0
+                        import datasets.config
                         while True:
-                            # 2. Measure PyArrow C++ Decompression & Reading
+                            # Measure ONLY Parquet Read / Decompress / Network Wait
                             t3 = time.perf_counter()
                             try:
                                 record_batch = next(batch_iter)
@@ -226,28 +227,13 @@ class Parquet(datasets.ArrowBasedBuilder):
                                 break
                             t4 = time.perf_counter()
                             
-                            # 3. Measure Hugging Face CPU casting
+                            if not hasattr(datasets.config, "hf_parquet_io_time"):
+                                datasets.config.hf_parquet_io_time = 0.0
+                            datasets.config.hf_parquet_io_time += (t4 - t3)
+                            
                             pa_table = pa.Table.from_batches([record_batch])
                             casted_table = self._cast_table(pa_table)
-                            t5 = time.perf_counter()
-                            
-                            # 4. Measure Downstream (Tokenization, PyTorch Collation, GPU wait)
                             yield Key(file_idx, batch_idx), casted_table
-                            t6 = time.perf_counter()
-                            
-                            # Calculate sizes and speeds
-                            size_mb = record_batch.nbytes / (1024 * 1024)
-                            read_speed = size_mb / (t4 - t3) if (t4 - t3) > 0 else 0
-                            
-                            print(
-                                f"\n[CPU BENCHMARK - File {file_idx} | Batch {batch_idx} | {size_mb:.2f} MB]\n"
-                                f"  -> File Open:          {t1 - t0:.4f}s\n"
-                                f"  -> Read Metadata:      {t2 - t1:.4f}s\n"
-                                f"  -> PyArrow Decompress: {t4 - t3:.4f}s ({read_speed:.2f} MB/s)\n"
-                                f"  -> HF Table Cast:      {t5 - t4:.4f}s\n"
-                                f"  -> Downstream (Yield): {t6 - t5:.4f}s (Tokenize/PyTorch/GPU)\n"
-                                f"------------------------------------------------"
-                            )
                             batch_idx += 1
             except (pa.ArrowInvalid, ValueError) as e:
                 if self.config.on_bad_files == "error":

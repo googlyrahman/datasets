@@ -147,15 +147,26 @@ def _examples_to_batch(examples: list[dict[str, Any]]) -> dict[str, list]:
 
 def _batch_to_examples(batch: dict[str, list]) -> Iterator[dict[str, Any]]:
     """Convert a batch (dict of examples) to examples list"""
-    t0 = time.perf_counter()
+    import datasets.config
+    
     n_examples = 0 if len(batch) == 0 else len(batch[next(iter(batch))])
     
-    # This is the line that shatters the PyArrow Table into Python Dicts
     for i in range(n_examples):
-        yield {col: array[i] for col, array in batch.items()}
+        # Start timer
+        t0 = time.perf_counter()
         
-    t1 = time.perf_counter()
-    print(f"BENCHMARK: _batch_to_examples took {t1 - t0:.6f}s for {n_examples} rows", flush=True)
+        # 1. Measure ONLY the C++ to Python Object instantiation
+        row = {col: array[i] for col, array in batch.items()}
+        
+        t1 = time.perf_counter()
+        
+        # Add to global accumulator safely
+        if not hasattr(datasets.config, "hf_dict_creation_time"):
+            datasets.config.hf_dict_creation_time = 0.0
+        datasets.config.hf_dict_creation_time += (t1 - t0)
+        
+        # 2. Yield to downstream (Time spent here belongs to .map() and collate)
+        yield row
 
 
 def _convert_to_arrow(
